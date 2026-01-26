@@ -422,8 +422,8 @@ const (
 	UNIQUE_NULLS_NOT_DISTINCT_ISSUE_DESCRIPTION                = "Unique constraint treating NULL values as non-distinct is not yet supported in YugabyteDB."
 	UNSUPPORTED_EXTENSION_ISSUE_DESCRIPTION                    = "This extension is not supported in YugabyteDB by default."
 
-	SAVEPOINT_USAGE_ISSUE_DESCRIPTION = "Detected SAVEPOINT usage in transactions. YugabyteDB CDC has a known limitation where DML operations rolled back via ROLLBACK TO SAVEPOINT are incorrectly emitted as CDC events. This can cause data inconsistencies during fall-forward/fall-back workflows."
-	SAVEPOINT_USAGE_ISSUE_SUGGESTION  = "Review and refactor transactions that use SAVEPOINTs. Consider using separate transactions or application-level error handling instead."
+	SAVEPOINT_USAGE_ISSUE_DESCRIPTION = "Detected SAVEPOINT usage in transactions. In older YugabyteDB versions, CDC has a known limitation where DML operations rolled back via ROLLBACK TO SAVEPOINT are incorrectly emitted as CDC events, causing data inconsistencies during fall-forward/fall-back workflows. This is fixed in YugabyteDB 2024.2.8.0+, 2025.1.3.0+, and 2025.2.1.0+ with the cdc_enable_savepoint_rollback_filtering flag."
+	SAVEPOINT_USAGE_ISSUE_SUGGESTION  = "For older YugabyteDB versions: Review and refactor transactions that use SAVEPOINTs. Consider using separate transactions or application-level error handling instead. For newer versions (2024.2.8.0+, 2025.1.3.0+, 2025.2.1.0+): This issue is resolved and SAVEPOINTs are fully supported."
 
 	//Hotspot on timestamp/date indexes
 
