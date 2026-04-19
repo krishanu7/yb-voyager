@@ -33,18 +33,19 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/exp/slices"
 
+	"github.com/yugabyte/yb-voyager/yb-voyager/src/constants"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/datafile"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/utils"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/utils/sqlname"
 )
 
 // Apart from these we also skip UDT columns. Array of enums, hstore, and tsvector are supported with logical connector (default).
-var YugabyteUnsupportedDataTypesForDbzmLogical = []string{"BOX", "CIRCLE", "LINE", "LSEG", "PATH", "PG_LSN", "POINT", "POLYGON", "TSQUERY", "TXID_SNAPSHOT", "GEOMETRY", "GEOGRAPHY", "RASTER", "INT4MULTIRANGE", "INT8MULTIRANGE", "NUMMULTIRANGE", "TSMULTIRANGE", "TSTZMULTIRANGE", "DATEMULTIRANGE"}
+var YugabyteUnsupportedDataTypesForDbzmLogical = []string{"BOX", "CIRCLE", "LINE", "LSEG", "PATH", "PG_LSN", "POINT", "POLYGON", "TSQUERY", "TXID_SNAPSHOT", "GEOMETRY", "GEOGRAPHY", "RASTER", "INT4MULTIRANGE", "INT8MULTIRANGE", "NUMMULTIRANGE", "TSMULTIRANGE", "TSTZMULTIRANGE", "DATEMULTIRANGE", "VECTOR", "TIMETZ"}
 
 // For the gRPC connector - datatypes like HSTORE/CITEXT/LTREE that are available by extensions, are not supported and the table of these needs to be skipped for the migration with grpc connector
 // but right now we are only skipping columns of that table and if there are DML on those tables the gRPC connector will error out.
 // TODO to handle that
-var YugabyteUnsupportedDataTypesForDbzmGrpc = []string{"BOX", "CIRCLE", "LINE", "LSEG", "PATH", "PG_LSN", "POINT", "POLYGON", "TSQUERY", "TSVECTOR", "TXID_SNAPSHOT", "GEOMETRY", "GEOGRAPHY", "RASTER", "HSTORE", "CITEXT", "LTREE", "INT4MULTIRANGE", "INT8MULTIRANGE", "NUMMULTIRANGE", "TSMULTIRANGE", "TSTZMULTIRANGE", "DATEMULTIRANGE"}
+var YugabyteUnsupportedDataTypesForDbzmGrpc = []string{"BOX", "CIRCLE", "LINE", "LSEG", "PATH", "PG_LSN", "POINT", "POLYGON", "TSQUERY", "TSVECTOR", "TXID_SNAPSHOT", "GEOMETRY", "GEOGRAPHY", "RASTER", "HSTORE", "CITEXT", "LTREE", "INT4MULTIRANGE", "INT8MULTIRANGE", "NUMMULTIRANGE", "TSMULTIRANGE", "TSTZMULTIRANGE", "DATEMULTIRANGE", "VECTOR", "TIMETZ"}
 
 func GetYugabyteUnsupportedDatatypesDbzm(isGRPCConnector bool) []string {
 	if isGRPCConnector {
@@ -359,14 +360,23 @@ func (yb *YugabyteDB) getExportedColumnsListForTable(exportDir, tableName string
 }
 
 // GetAllSequences returns all the sequence names in the database for the given schema list
-func (yb *YugabyteDB) GetAllSequences() []string {
-	schemaList := sqlname.ExtractIdentifiersUnquoted(yb.source.Schemas)
-	querySchemaList := "'" + strings.Join(schemaList, "','") + "'"
-	var sequenceNames []string
-	query := fmt.Sprintf(`SELECT sequence_name FROM information_schema.sequences where sequence_schema IN (%s);`, querySchemaList)
+func (yb *YugabyteDB) GetSequencesLastValues(sequencesList []sqlname.NameTuple) (*utils.StructMap[sqlname.ObjectName, int64], error) {
+	sequenceQueryList := sqlname.JoinNameTuplesUnquoted(sequencesList, "','")
+	result := utils.NewStructMap[sqlname.ObjectName, int64]()
+	query := fmt.Sprintf(`SELECT schemaname, sequencename, COALESCE(last_value, 0) as last_value FROM pg_sequences where (schemaname || '.' || sequencename) IN ('%s');`, sequenceQueryList)
 	rows, err := yb.db.Query(query)
 	if err != nil {
-		utils.ErrExit("error in querying source database for sequence names: %q: %w\n", query, err)
+		if strings.Contains(err.Error(), "does not exist") {
+			//For PG version before 10 as identity columns are also introduced in PG 10 so using information_schema.sequences but it will not return the last value for the sequences
+			//will not work on PG <=10
+			query = fmt.Sprintf(`SELECT sequence_schema, sequence_name, 0 as last_value FROM information_schema.sequences where (sequence_schema || '.' || sequence_name) IN ('%s');`, sequenceQueryList)
+			rows, err = yb.db.Query(query)
+			if err != nil {
+				return nil, fmt.Errorf("error in querying(%q) source database for sequence last values: %w", query, err)
+			}
+		} else {
+			return nil, fmt.Errorf("error in querying(%q) source database for sequence last values: %w", query, err)
+		}
 	}
 	defer func() {
 		closeErr := rows.Close()
@@ -375,15 +385,18 @@ func (yb *YugabyteDB) GetAllSequences() []string {
 		}
 	}()
 
-	var sequenceName string
+	var sequenceName, sequenceSchema string
+	var lastValue int64
 	for rows.Next() {
-		err = rows.Scan(&sequenceName)
+		err = rows.Scan(&sequenceSchema, &sequenceName, &lastValue)
 		if err != nil {
 			utils.ErrExit("error in scanning query rows for sequence names: %w\n", err)
 		}
-		sequenceNames = append(sequenceNames, sequenceName)
+		qualifiedSequenceName := fmt.Sprintf(`"%s"."%s"`, sequenceSchema, sequenceName)
+		objName := sqlname.NewObjectNameWithQualifiedName(constants.YUGABYTEDB, "public", qualifiedSequenceName)
+		result.Put(*objName, lastValue)
 	}
-	return sequenceNames
+	return result, nil
 }
 
 // GetAllSequencesRaw returns all the sequence names in the database for the schema
@@ -1155,6 +1168,15 @@ func (yb *YugabyteDB) DropLogicalReplicationSlot(conn *pgconn.PgConn, replicatio
 		defer conn.Close(context.Background())
 	}
 	log.Infof("dropping replication slot: %s", replicationSlotName)
+
+	exists, err := yb.CheckIfReplicationSlotExists(replicationSlotName)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		log.Infof("replication slot %s does not exist, skipping dropping", replicationSlotName)
+		return nil
+	}
 
 	// TODO: Remove this sleep and check the status of the slot before dropping
 	// This sleep is added to avoid the error "replication slot is active" while dropping the slot since it takes 60 seconds by default to change the status of the slot

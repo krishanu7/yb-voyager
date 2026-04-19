@@ -39,7 +39,6 @@ import (
 	pgconn5 "github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/jinzhu/copier"
-	"github.com/pingcap/failpoint"
 	"github.com/samber/lo"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/exp/slices"
@@ -305,18 +304,8 @@ func (yb *TargetYugabyteDB) InitConnPool() error {
 	}
 	log.Infof("targetUriList: %s", utils.GetRedactedURLs(targetUriList))
 
-	if yb.Tconf.Parallelism <= 0 {
-		yb.Tconf.Parallelism = fetchDefaultParallelJobs(tconfs, YB_DEFAULT_PARALLELISM_FACTOR)
-		log.Infof("Using %d parallel jobs by default. Use --parallel-jobs to specify a custom value", yb.Tconf.Parallelism)
-	}
-
-	if yb.tconf.AdaptiveParallelismMode.IsEnabled() {
-		if yb.tconf.MaxParallelism <= 0 {
-			yb.tconf.MaxParallelism = yb.tconf.Parallelism * 2
-		}
-	} else {
-		yb.Tconf.MaxParallelism = yb.Tconf.Parallelism
-	}
+	nodeCount := len(confs) // confs from GetYBServers() has all nodes, even when using a load balancer
+	yb.setDefaultParallelism(tconfs, nodeCount, loadBalancerUsed)
 	params := &ConnectionParams{
 		NumConnections:    yb.Tconf.Parallelism,
 		NumMaxConnections: yb.Tconf.MaxParallelism,
@@ -422,7 +411,7 @@ func (yb *TargetYugabyteDB) IsNonRetryableCopyError(err error) bool {
 	return utils.ContainsAnySubstringFromSlice(NonRetryCopyErrorsYB, err.Error())
 }
 
-func (yb *TargetYugabyteDB) checkIfPrimaryKeyViolationError(err error, pkConstraintNames []string) bool {
+func checkIfPrimaryKeyViolationError(err error, pkConstraintNames []string) bool {
 	if err == nil {
 		return false
 	}
@@ -519,7 +508,7 @@ const BATCH_METADATA_TABLE_SCHEMA = "ybvoyager_metadata"
 const BATCH_METADATA_TABLE_NAME = BATCH_METADATA_TABLE_SCHEMA + "." + "ybvoyager_import_data_batches_metainfo_v3"
 const EVENT_CHANNELS_METADATA_TABLE_NAME = BATCH_METADATA_TABLE_SCHEMA + "." + "ybvoyager_import_data_event_channels_metainfo"
 const EVENTS_PER_TABLE_METADATA_TABLE_NAME = BATCH_METADATA_TABLE_SCHEMA + "." + "ybvoyager_imported_event_count_by_table"
-const YB_DEFAULT_PARALLELISM_FACTOR = 2 // factor for default parallelism in case fetchDefaultParallelJobs() is not able to get the no of cores
+const YB_DEFAULT_CORES_PER_NODE = 16 // assumed vCPUs per node when core detection fails
 const ALTER_QUERY_RETRY_COUNT = 5
 
 func (yb *TargetYugabyteDB) CreateVoyagerSchema() error {
@@ -748,7 +737,7 @@ func (yb *TargetYugabyteDB) importBatch(conn *pgx.Conn, batch Batch, args *Impor
 	if err != nil {
 		return 0, newImportBatchErrorPgYb(err, batch,
 			errs.IMPORT_BATCH_ERROR_FLOW_COPY_NORMAL,
-			errs.IMPORT_BATCH_ERROR_STEP_BEGIN_TXN)
+			errs.IMPORT_BATCH_ERROR_STEP_BEGIN_TXN, nil)
 	}
 	defer func() {
 		var err2 error
@@ -758,32 +747,21 @@ func (yb *TargetYugabyteDB) importBatch(conn *pgx.Conn, batch Batch, args *Impor
 				rowsAffected = 0
 				err = newImportBatchErrorPgYb(fmt.Errorf("%w (while processing %s)", err2, err), batch,
 					errs.IMPORT_BATCH_ERROR_FLOW_COPY_NORMAL,
-					errs.IMPORT_BATCH_ERROR_STEP_ROLLBACK_TXN)
+					errs.IMPORT_BATCH_ERROR_STEP_ROLLBACK_TXN, nil)
 			}
 		} else {
-			// Failpoint: inject error before commit for testing
-			// Use failpoint.Value parameter to distinguish between 'off' and 'return' actions
-			// When val != nil, the failpoint action is active (e.g., return())
-			// When val == nil, the failpoint action is 'off' (skip error injection)
-			failpoint.Inject("importBatchCommitError", func(val failpoint.Value) {
-				if val != nil {
-					// Inject commit error only when action is not 'off'
-					err2 = goerrors.Errorf("failpoint: commit failed")
-					err = newImportBatchErrorPgYb(err2, batch,
-						errs.IMPORT_BATCH_ERROR_FLOW_COPY_NORMAL,
-						errs.IMPORT_BATCH_ERROR_STEP_COMMIT_TXN)
-					rowsAffected = 0
-					failpoint.Return() // special function to make outer function return
-				}
-				// If val == nil ('off' action), do nothing - let commit proceed normally
-			})
+			if triggered, fpErr := injectImportBatchCommitError(batch); triggered {
+				rowsAffected = 0
+				err = fpErr
+				return
+			}
 
 			err2 = tx.Commit(ctx)
 			if err2 != nil {
 				rowsAffected = 0
 				err = newImportBatchErrorPgYb(err2, batch,
 					errs.IMPORT_BATCH_ERROR_FLOW_COPY_NORMAL,
-					errs.IMPORT_BATCH_ERROR_STEP_COMMIT_TXN)
+					errs.IMPORT_BATCH_ERROR_STEP_COMMIT_TXN, nil)
 			}
 		}
 	}()
@@ -806,7 +784,7 @@ func (yb *TargetYugabyteDB) importBatchFast(conn *pgx.Conn, batch Batch, args *I
 		Lets say the importBatchFastRecover fails with some trasient DB error. In that case,
 		caller(fileTaskImporter.importBatch() function) takes care of retrying with importBatchFastRecover
 	*/
-	if yb.checkIfPrimaryKeyViolationError(err, args.PKConstraintNames) {
+	if checkIfPrimaryKeyViolationError(err, args.PKConstraintNames) {
 		log.Infof("falling back to importBatchFastRecover for batch %q: %s", batch.GetFilePath(), err.Error())
 		return yb.importBatchFastRecover(conn, batch, args)
 	}
@@ -820,7 +798,7 @@ func (yb *TargetYugabyteDB) copyBatchCore(conn *pgx.Conn, batch Batch, args *Imp
 	if err != nil {
 		err = newImportBatchErrorPgYb(err, batch,
 			lo.Ternary(args.ShouldUseFastPath(), errs.IMPORT_BATCH_ERROR_FLOW_COPY_FAST, errs.IMPORT_BATCH_ERROR_FLOW_COPY_NORMAL),
-			errs.IMPORT_BATCH_ERROR_STEP_OPEN_BATCH)
+			errs.IMPORT_BATCH_ERROR_STEP_OPEN_BATCH, nil)
 		return 0, err
 	}
 	defer file.Close()
@@ -834,7 +812,7 @@ func (yb *TargetYugabyteDB) copyBatchCore(conn *pgx.Conn, batch Batch, args *Imp
 	if err != nil {
 		err = newImportBatchErrorPgYb(err, batch,
 			lo.Ternary(args.ShouldUseFastPath(), errs.IMPORT_BATCH_ERROR_FLOW_COPY_FAST, errs.IMPORT_BATCH_ERROR_FLOW_COPY_NORMAL),
-			errs.IMPORT_BATCH_ERROR_STEP_CHECK_BATCH_ALREADY_IMPORTED)
+			errs.IMPORT_BATCH_ERROR_STEP_CHECK_BATCH_ALREADY_IMPORTED, nil)
 		return 0, err
 	}
 	if alreadyImported {
@@ -858,7 +836,7 @@ func (yb *TargetYugabyteDB) copyBatchCore(conn *pgx.Conn, batch Batch, args *Imp
 	if err != nil {
 		err = newImportBatchErrorPgYb(err, batch,
 			lo.Ternary(args.ShouldUseFastPath(), errs.IMPORT_BATCH_ERROR_FLOW_COPY_FAST, errs.IMPORT_BATCH_ERROR_FLOW_COPY_NORMAL),
-			errs.IMPORT_BATCH_ERROR_STEP_COPY)
+			errs.IMPORT_BATCH_ERROR_STEP_COPY, args.PKConstraintNames)
 
 		return res.RowsAffected(), err
 	}
@@ -868,7 +846,7 @@ func (yb *TargetYugabyteDB) copyBatchCore(conn *pgx.Conn, batch Batch, args *Imp
 	if err != nil {
 		err = newImportBatchErrorPgYb(err, batch,
 			lo.Ternary(args.ShouldUseFastPath(), errs.IMPORT_BATCH_ERROR_FLOW_COPY_FAST, errs.IMPORT_BATCH_ERROR_FLOW_COPY_NORMAL),
-			errs.IMPORT_BATCH_ERROR_STEP_METADATA_ENTRY)
+			errs.IMPORT_BATCH_ERROR_STEP_METADATA_ENTRY, nil)
 		return res.RowsAffected(), err
 	}
 	return res.RowsAffected(), nil
@@ -882,7 +860,7 @@ func (yb *TargetYugabyteDB) importBatchFastRecover(conn *pgx.Conn, batch Batch, 
 	if err != nil {
 		return 0, newImportBatchErrorPgYb(err, batch,
 			errs.IMPORT_BATCH_ERROR_FLOW_COPY_RECOVER,
-			errs.IMPORT_BATCH_ERROR_STEP_CHECK_BATCH_ALREADY_IMPORTED)
+			errs.IMPORT_BATCH_ERROR_STEP_CHECK_BATCH_ALREADY_IMPORTED, nil)
 	}
 	if alreadyImported {
 		log.Infof("batch %q already imported, skipping fast recover", batch.GetFilePath())
@@ -894,7 +872,7 @@ func (yb *TargetYugabyteDB) importBatchFastRecover(conn *pgx.Conn, batch Batch, 
 	if err != nil {
 		return 0, newImportBatchErrorPgYb(err, batch,
 			errs.IMPORT_BATCH_ERROR_FLOW_COPY_RECOVER,
-			errs.IMPORT_BATCH_ERROR_STEP_OPEN_BATCH)
+			errs.IMPORT_BATCH_ERROR_STEP_OPEN_BATCH, nil)
 	}
 	defer df.Close()
 
@@ -911,7 +889,7 @@ func (yb *TargetYugabyteDB) importBatchFastRecover(conn *pgx.Conn, batch Batch, 
 		if readLinErr != nil && readLinErr != io.EOF {
 			return 0, newImportBatchErrorPgYb(err, batch,
 				errs.IMPORT_BATCH_ERROR_FLOW_COPY_RECOVER,
-				errs.IMPORT_BATCH_ERROR_STEP_READ_LINE_BATCH)
+				errs.IMPORT_BATCH_ERROR_STEP_READ_LINE_BATCH, nil)
 		}
 
 		/*
@@ -939,7 +917,7 @@ func (yb *TargetYugabyteDB) importBatchFastRecover(conn *pgx.Conn, batch Batch, 
 		res, err := conn.PgConn().CopyFrom(context.Background(), singleLineReader, copyCommand)
 		if err != nil {
 			// Ignore err if its VIOLATES_UNIQUE_CONSTRAINT_ERROR_RETRYABLE_FAST_PATH only
-			if yb.checkIfPrimaryKeyViolationError(err, args.PKConstraintNames) {
+			if checkIfPrimaryKeyViolationError(err, args.PKConstraintNames) {
 				// logging lineNum might not be useful as batches are truncated later on
 				log.Debugf("ignoring error %s for line=%q in batch %q", err.Error(), line, batch.GetFilePath())
 				rowsIgnored++ // increment before continuing to next line
@@ -948,7 +926,7 @@ func (yb *TargetYugabyteDB) importBatchFastRecover(conn *pgx.Conn, batch Batch, 
 
 			err = newImportBatchErrorPgYb(err, batch,
 				errs.IMPORT_BATCH_ERROR_FLOW_COPY_RECOVER,
-				errs.IMPORT_BATCH_ERROR_STEP_COPY)
+				errs.IMPORT_BATCH_ERROR_STEP_COPY, args.PKConstraintNames)
 			return rowsAffected + rowsIgnored, err
 		}
 
@@ -975,7 +953,7 @@ func (yb *TargetYugabyteDB) importBatchFastRecover(conn *pgx.Conn, batch Batch, 
 	if err != nil {
 		return 0, newImportBatchErrorPgYb(err, batch,
 			errs.IMPORT_BATCH_ERROR_FLOW_COPY_RECOVER,
-			errs.IMPORT_BATCH_ERROR_STEP_METADATA_ENTRY)
+			errs.IMPORT_BATCH_ERROR_STEP_METADATA_ENTRY, nil)
 	}
 
 	// 7. log the summary: how many conflicts, how many inserted, how many update/upserted
@@ -988,12 +966,21 @@ func (yb *TargetYugabyteDB) importBatchFastRecover(conn *pgx.Conn, batch Batch, 
 	return totalRowsInBatch, nil
 }
 
-func newImportBatchErrorPgYb(underlyingErr error, batch Batch, flow string, step string) errs.ImportBatchError {
+func newImportBatchErrorPgYb(underlyingErr error, batch Batch, flow string, step string, pkConstraintNames []string) errs.ImportBatchError {
 	dbContext := map[string]string{}
+	var errorType string
 	var pgerr *pgconn.PgError
 	if errors.As(underlyingErr, &pgerr) {
-		if pgerr.Where != "" {
-			dbContext["where"] = pgerr.Where
+		dbContext["where"] = pgerr.Where
+		switch pgerr.Code {
+		case "23505": // unique_violation
+			if checkIfPrimaryKeyViolationError(underlyingErr, pkConstraintNames) {
+				errorType = errs.ERROR_TYPE_PK_VIOLATION
+			} else {
+				errorType = errs.ERROR_TYPE_UNIQUE_VIOLATION
+			}
+		case "23503": // foreign_key_violation
+			errorType = errs.ERROR_TYPE_FOREIGN_KEY_VIOLATION
 		}
 	}
 
@@ -1003,6 +990,7 @@ func newImportBatchErrorPgYb(underlyingErr error, batch Batch, flow string, step
 		underlyingErr,
 		flow,
 		step,
+		errorType,
 		dbContext)
 }
 
@@ -1073,6 +1061,11 @@ and needs to be prepared again
 */
 func (yb *TargetYugabyteDB) ExecuteBatch(migrationUUID uuid.UUID, batch *EventBatch) error {
 	log.Infof("executing batch(%s) of %d events", batch.ID(), len(batch.Events))
+
+	if fpErr := injectImportCDCRetryableExecuteBatchError(); fpErr != nil {
+		return fpErr
+	}
+
 	ybBatch := pgx.Batch{}
 	stmtToPrepare := make(map[string]string)
 	// processing batch events to convert into prepared or unprepared statements based on Op type
@@ -1142,6 +1135,9 @@ func (yb *TargetYugabyteDB) ExecuteBatch(migrationUUID uuid.UUID, batch *EventBa
 		}
 		for i := 0; i < len(batch.Events); i++ {
 			res, err := br.Exec()
+			if fpErr := injectImportCDCExecEventError(); fpErr != nil {
+				err = fpErr
+			}
 			if err != nil {
 				// When using pgx SendBatch, there can be two types of errors thrown:
 				// 1. Error while preparing the statement - this is preprocessing (parsing, preparinng statements, etc)
@@ -1213,6 +1209,17 @@ func (yb *TargetYugabyteDB) ExecuteBatch(migrationUUID uuid.UUID, batch *EventBa
 		if err = tx.Commit(ctx); err != nil {
 			return false, fmt.Errorf("failed to commit transaction : %w", err)
 		}
+
+		// Failpoint: simulate the "commit succeeded but ExecuteBatch returned a retryable error" case.
+		//
+		// This models scenarios like transient RPC/timeout errors on commit where the transaction
+		if fpErr := injectImportCDCRetryableAfterCommitError(); fpErr != nil {
+			err = fpErr
+		}
+		if err != nil {
+			return false, err
+		}
+
 		logDiscrepancyInEventBatchIfAny(batch, rowsAffectedInserts, rowsAffectedDeletes, rowsAffectedUpdates)
 		return false, err
 	})
@@ -1456,20 +1463,61 @@ func fetchCores(tconfs []*TargetConf) (int, error) {
 	return totalCores, nil
 }
 
-func fetchDefaultParallelJobs(tconfs []*TargetConf, defaultParallelismFactor int) int {
-	totalCores, err := fetchCores(tconfs)
-	if err != nil {
-		defaultParallelJobs := len(tconfs) * defaultParallelismFactor
-		log.Errorf("error while fetching the cores information and using default parallelism: %v : %v ", defaultParallelJobs, err)
-		return defaultParallelJobs
+// setDefaultParallelism sets Parallelism and MaxParallelism on yb.tconf if not already
+// specified by the user. Parallelism is set by fetchDefaultParallelJobs(), and MaxParallelism defaults
+// to Parallelism*4 (i.e. clusterCores) when adaptive parallelism is enabled.
+func (yb *TargetYugabyteDB) setDefaultParallelism(tconfs []*TargetConf, nodeCount int, loadBalancerUsed bool) {
+	if yb.tconf.Parallelism <= 0 {
+		yb.tconf.Parallelism = yb.fetchDefaultParallelJobs(tconfs, nodeCount, loadBalancerUsed)
+		log.Infof("Using %d parallel jobs by default. Use --parallel-jobs to specify a custom value", yb.tconf.Parallelism)
 	}
-	if totalCores == 0 { //if target is running on MacOS, we are unable to determine totalCores
+
+	if yb.tconf.AdaptiveParallelismMode.IsEnabled() {
+		if yb.tconf.MaxParallelism <= 0 {
+			yb.tconf.MaxParallelism = yb.tconf.Parallelism * 4
+		}
+	} else {
+		yb.tconf.MaxParallelism = yb.tconf.Parallelism
+	}
+}
+
+// Determines totalCores for the cluster to compute default parallel jobs (totalCores / 4).
+//
+// tconfs are the connection targets voyager uses. Behind a load balancer, this collapses to a
+// single entry (the LB address), so fetchCores only reaches one node. nodeCount is the actual
+// number of nodes reported by yb_servers(), which may be greater than len(tconfs).
+//
+// Four cases:
+//  1. No LB, fetchCores succeeded  — totalCores = sum of cores across all nodes (accurate).
+//  2. LB,    fetchCores succeeded  — totalCores = single-node cores * nodeCount (extrapolated).
+//  3. LB,    fetchCores failed     — totalCores = nodeCount * YB_DEFAULT_CORES_PER_NODE (estimated; typical for YBAeon).
+//  4. No LB, fetchCores failed     — totalCores = nodeCount * YB_DEFAULT_CORES_PER_NODE (estimated; rare, e.g. permission issues).
+func (yb *TargetYugabyteDB) fetchDefaultParallelJobs(tconfs []*TargetConf, nodeCount int, loadBalancerUsed bool) int {
+	var clusterCores int
+	detectedCores, err := fetchCores(tconfs)
+	coresFetched := err == nil
+
+	switch {
+	case coresFetched && !loadBalancerUsed:
+		// Case 1: No load balancer, use detected cores directly
+		clusterCores = detectedCores
+	case coresFetched && loadBalancerUsed:
+		// Case 2: fetchCores only reached one node via load balancer; extrapolate to the full cluster
+		clusterCores = detectedCores * nodeCount
+		log.Infof("Load balancer detected: scaling single-node cores to cluster: %d cores/node * %d nodes = %d clusterCores",
+			detectedCores, nodeCount, clusterCores)
+	default:
+		// Case 3 & 4: No cores detected, estimate using the number of nodes and the default cores per node
+		clusterCores = nodeCount * YB_DEFAULT_CORES_PER_NODE
+		log.Warnf("Could not determine cores, estimating clusterCores = %d nodes * %d cores/node = %d",
+			nodeCount, YB_DEFAULT_CORES_PER_NODE, clusterCores)
+	}
+
+	// macOS: fetchCores succeeds but returns 0 because /proc/cpuinfo doesn't exist
+	if clusterCores == 0 {
 		return 3
 	}
-	if tconfs[0].TargetDBType == YUGABYTEDB {
-		return totalCores / 4
-	}
-	return totalCores / 2
+	return clusterCores / 4
 }
 
 // import session parameters

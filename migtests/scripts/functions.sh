@@ -554,9 +554,9 @@ archive_changes() {
 
     ARCHIVE_DIR=${EXPORT_DIR}/archive-dir
     mkdir ${ARCHIVE_DIR}
-    yb-voyager archive changes --move-to ${ARCHIVE_DIR} \
+    yb-voyager archive changes --policy archive --archive-dir ${ARCHIVE_DIR} \
         --export-dir ${EXPORT_DIR} \
-        --fs-utilization-threshold 0
+        --send-diagnostics=false
 }
 
 end_migration() {
@@ -578,7 +578,7 @@ end_migration() {
     yb-voyager end migration --export-dir ${EXPORT_DIR} \
         --backup-dir ${BACKUP_DIR} --backup-schema-files true \
         --backup-data-files true --backup-log-files true \
-        --save-migration-reports true "$@" || {
+        --save-migration-reports true --send-diagnostics=false "$@" || {
             cat ${EXPORT_DIR}/logs/yb-voyager-end-migration.log
             exit 1
         }
@@ -1407,8 +1407,8 @@ create_source_db() {
 	source_db=$1
 	case ${SOURCE_DB_TYPE} in
 		postgresql)
-			run_psql postgres "DROP DATABASE IF EXISTS ${source_db};"
-			run_psql postgres "CREATE DATABASE ${source_db};"
+			run_psql postgres "DROP DATABASE IF EXISTS \"${source_db}\";"
+			run_psql postgres "CREATE DATABASE \"${source_db}\";"
 			;;
 		mysql)
 			run_mysql mysql "DROP DATABASE IF EXISTS ${source_db};"
@@ -1495,7 +1495,16 @@ normalize_callhome_json() {
             .yb_cluster_metrics = "IGNORED" |
             .parallel_jobs = "IGNORED" |
             .adaptive_parallelism_max = "IGNORED" |
-            .snapshot_total_bytes = "IGNORED"
+            .snapshot_total_bytes = "IGNORED" |
+            .collected_at = "IGNORED" |
+            .phase_start_time = "IGNORED" |
+            .time_taken_sec = "IGNORED" |
+            .yb_voyager_version = "IGNORED" |
+            .migration_uuid = "IGNORED" |
+            .db_version = "IGNORED" |
+            .db_system_identifier = "IGNORED" |
+            .target_db_details = "IGNORED" |
+            .total_db_size_bytes = "IGNORED"
         elif type == "array" then
 			sort_by(tostring)
         elif type == "string" and (

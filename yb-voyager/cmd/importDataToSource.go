@@ -36,8 +36,15 @@ var importDataToSourceCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		validateMetaDBCreated()
 		importType = SNAPSHOT_AND_CHANGES
+		msr, err := metaDB.GetMigrationStatusRecord()
+		if err != nil {
+			utils.ErrExit("failed to get migration status record: %w", err)
+		}
+		if !msr.FallbackEnabled {
+			utils.ErrExit("fallback is not enabled for this migration")
+		}
 		importerRole = SOURCE_DB_IMPORTER_ROLE
-		err := initTargetConfFromSourceConf()
+		err = initTargetConfFromSourceConf()
 		if err != nil {
 			utils.ErrExit("failed to setup target conf from source conf in MSR: %w", err)
 		}
@@ -94,7 +101,7 @@ func packAndSendImportDataToSourcePayload(status string, errorMsg error) {
 	if !shouldSendCallhome() {
 		return
 	}
-	payload := createCallhomePayload()
+	payload := createCallhomePayload(migrationUUID)
 
 	payload.MigrationType = LIVE_MIGRATION
 
@@ -119,6 +126,9 @@ func packAndSendImportDataToSourcePayload(status string, errorMsg error) {
 		dataMetrics.MigrationCdcTotalImportedEvents = statsReporter.TotalEventsImported
 		dataMetrics.CdcEventsImportRate3min = statsReporter.EventsImportRateLast3Min
 	}
+
+	// Set table list count
+	dataMetrics.TableListCount = len(importTableList)
 
 	importDataPayload := callhome.ImportDataPhasePayload{
 		PayloadVersion:   callhome.IMPORT_DATA_CALLHOME_PAYLOAD_VERSION,

@@ -101,7 +101,7 @@ func exportSchema(cmd *cobra.Command) error {
 	} else if startClean {
 		utils.PrintAndLogf("Schema is not exported yet. Ignoring --start-clean flag.\n\n")
 	}
-	CreateMigrationProjectIfNotExists(source.DBType, exportDir)
+	metaDB = CreateMigrationProjectIfNotExists(source.DBType, exportDir)
 	err := retrieveMigrationUUID()
 	if err != nil {
 		log.Errorf("failed to get migration UUID: %v", err)
@@ -809,10 +809,12 @@ func applyIndexFileTransformations() (*sqltransformer.IndexFileTransformer, erro
 	//assuming that assessment is run and fetched the redundant indexes
 	//TODO: see if we need to take care of the scenario where assessment is unable to fetch these
 	var err error
-	var redundantIndexToResolvedExistingIndex *utils.StructMap[*sqlname.ObjectNameQualifiedWithTableName, string]
+	redundantIndexToResolvedExistingIndex := utils.NewStructMap[*sqlname.ObjectNameQualifiedWithTableName, string]()
 	redundantIndexToResolvedExistingIndex, err = fetchRedundantIndexMapFromAssessmentDB()
 	if err != nil {
 		if skipPerfOptimizations {
+			//this is done to handle errors but if skip is used we need to put the redundant indexes in the schema optimization report
+			//so can't skip fetching the redundant indexes in this case
 			log.Infof("skipping error while fetching redundant index map from assessment db: %v", err)
 			return nil, nil
 		}

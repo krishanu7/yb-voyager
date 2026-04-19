@@ -294,15 +294,15 @@ func TestImportDataFileReport_ErrorPolicyStashAndContinue_BatchIngestionError(t 
 	testutils.FatalIfError(t, err, "End migration command failed")
 
 	// Verify that the backup directory contains the expected error files.
-	// error file is expected to be under dir table::test_data/file::test_data_data.sql:1960b25c and of the name ingestion-error.batch::1.10.10.92.E
 	tableDir := fmt.Sprintf("table::%s", tblName.ForKey())
 	fileDir := fmt.Sprintf("file::%s:%s", filepath.Base(dataFilePath), importdata.ComputePathHash(dataFilePath))
 	tableFileErrorsDir := filepath.Join(backupDir, "data", "errors", tableDir, fileDir)
-	errorFilePath := filepath.Join(tableFileErrorsDir, "ingestion-error.batch::1.10.10.100.E")
-	assert.FileExistsf(t, errorFilePath, "Expected error file %s to exist", errorFilePath)
+	errorFiles, globErr := filepath.Glob(filepath.Join(tableFileErrorsDir, "ingestion-error.batch::1.10.10.100.*.E"))
+	assert.NoError(t, globErr)
+	assert.Equal(t, 1, len(errorFiles), "Expected exactly one ingestion error file, found: %v", errorFiles)
 
 	// Verify the content of the error file
-	testutils.AssertFileContains(t, errorFilePath, "duplicate key value violates unique constraint")
+	testutils.AssertFileContains(t, errorFiles[0], "duplicate key value violates unique constraint")
 }
 
 func TestImportDataFileReport_ErrorPolicyStashAndContinue_ProcessingError(t *testing.T) {
@@ -746,4 +746,66 @@ func TestImportDataFile_SameFileForMultipleTables(t *testing.T) {
 		Status:             "DONE",
 		PercentageComplete: 100,
 	}, statusReport[1], "Status report row mismatch")
+}
+
+func TestImportDataFile_GeneratedAlwaysAsIdentity(t *testing.T) {
+	exportDir = testutils.CreateTempExportDir()
+	defer testutils.RemoveTempExportDir(exportDir)
+
+	setupYugabyteTestDb(t)
+
+	createTableSQL := `CREATE TABLE public.identity_file_test (
+		id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+		name TEXT NOT NULL
+	);`
+	testYugabyteDBTarget.TestContainer.ExecuteSqls(createTableSQL)
+	t.Cleanup(func() {
+		testYugabyteDBTarget.TestContainer.ExecuteSqls("DROP TABLE IF EXISTS public.identity_file_test;")
+	})
+
+	// CSV contains only the non-identity column; id will be auto-generated.
+	dataFilePath := filepath.Join("/tmp", "identity_file_test.csv")
+	f, err := os.Create(dataFilePath)
+	testutils.FatalIfError(t, err, "Failed to create CSV file")
+	defer os.Remove(dataFilePath)
+	defer f.Close()
+
+	w := csv.NewWriter(f)
+	w.Write([]string{"name"})
+	for i := 1; i <= 50; i++ {
+		w.Write([]string{fmt.Sprintf("name_%d", i)})
+	}
+	w.Flush()
+
+	err = testutils.NewVoyagerCommandRunner(testYugabyteDBTarget.TestContainer, "import data file", []string{
+		"--export-dir", exportDir,
+		"--disable-pb", "true",
+		"--target-db-schema", "public",
+		"--data-dir", filepath.Dir(dataFilePath),
+		"--file-table-map", "identity_file_test.csv:public.identity_file_test",
+		"--format", "CSV",
+		"--has-header", "true",
+		"--yes",
+	}, nil, false).Run()
+	testutils.FatalIfError(t, err, "import data file failed")
+
+	ybConn, err := testYugabyteDBTarget.TestContainer.GetConnection()
+	testutils.FatalIfError(t, err, "connecting to YugabyteDB")
+	defer ybConn.Close()
+
+	// Verify row count
+	var rowCount int
+	err = ybConn.QueryRow("SELECT COUNT(*) FROM public.identity_file_test").Scan(&rowCount)
+	assert.NoError(t, err)
+	assert.Equal(t, 50, rowCount, "expected 50 rows imported")
+
+	// Verify identity column values were auto-generated (non-null, sequential)
+	var minID, maxID int
+	err = ybConn.QueryRow("SELECT MIN(id), MAX(id) FROM public.identity_file_test").Scan(&minID, &maxID)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, minID, "identity sequence should start at 1")
+	assert.Equal(t, 50, maxID, "identity sequence should reach 50")
+
+	// Verify the identity column is still GENERATED ALWAYS
+	assertIdentityColumnIsAlways(t, ybConn, "public", "identity_file_test", "id")
 }
